@@ -32,7 +32,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/manager/signals"
 
 	"github.com/open-cluster-management/multicloud-operators-subscription/pkg/apis"
-	ansiblejob "github.com/open-cluster-management/multicloud-operators-subscription/pkg/apis/apps/ansible/v1alpha1"
 	"github.com/open-cluster-management/multicloud-operators-subscription/pkg/controller"
 	leasectrl "github.com/open-cluster-management/multicloud-operators-subscription/pkg/controller/subscription"
 	"github.com/open-cluster-management/multicloud-operators-subscription/pkg/subscriber"
@@ -118,10 +117,10 @@ func RunManager() {
 	klog.Info("Starting ... Registering Components for cluster: ", id)
 
 	// Setup ansibleJob Scheme for manager
-	if err := ansiblejob.AddToScheme(mgr.GetScheme()); err != nil {
-		klog.Error(err, "")
-		os.Exit(1)
-	}
+	//if err := ansiblejob.AddToScheme(mgr.GetScheme()); err != nil {
+	//	klog.Error(err, "")
+	//	os.Exit(1)
+	//}
 
 	// Setup Scheme for all resources
 	if err := apis.AddToScheme(mgr.GetScheme()); err != nil {

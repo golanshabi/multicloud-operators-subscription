@@ -19,6 +19,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"path/filepath"
 	"reflect"
 	"regexp"
@@ -28,6 +29,7 @@ import (
 	"github.com/pkg/errors"
 	gerr "github.com/pkg/errors"
 	"helm.sh/helm/v3/pkg/repo"
+	v1 "k8s.io/api/core/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -54,86 +56,6 @@ type kubeResource struct {
 type kubeResourceMetadata struct {
 	Name      string `yaml:"name"`
 	Namespace string `yaml:"namespace"`
-}
-
-// UpdateGitDeployablesAnnotation clones the git repo and regenerate deployables and update annotation if needed
-func (r *ReconcileSubscription) UpdateGitDeployablesAnnotation(sub *appv1.Subscription) (bool, error) {
-	updated := false
-	origsub := &appv1.Subscription{}
-	sub.DeepCopyInto(origsub)
-
-	primaryChannel, _, err := r.getChannel(sub)
-
-	if err != nil {
-		klog.Errorf("Failed to find a channel for subscription: %s", sub.GetName())
-		return false, err
-	}
-
-	if utils.IsGitChannel(string(primaryChannel.Spec.Type)) {
-		klog.Infof("Subscription %s has Git type channel.", sub.GetName())
-
-		//making sure the commit id is coming from the same source
-		commit, err := r.hubGitOps.GetLatestCommitID(sub)
-		if err != nil {
-			klog.Error(err.Error())
-			return false, err
-		}
-
-		annotations := sub.GetAnnotations()
-		if annotations == nil {
-			annotations = make(map[string]string)
-			sub.SetAnnotations(annotations)
-		}
-
-		subKey := types.NamespacedName{Name: sub.GetName(), Namespace: sub.GetNamespace()}
-		// Compare the commit to the Git repo and update deployables only if the commit has changed
-		// If subscription does not have commit annotation, it needs to be generated in this block.
-		oldCommit := getCommitID(sub)
-
-		if oldCommit == "" || !strings.EqualFold(oldCommit, commit) ||
-			r.isHookUpdate(annotations, subKey) {
-			if oldCommit == "" || !strings.EqualFold(oldCommit, commit) {
-				klog.Infof("The Git commit has changed since the last reconcile. last: %s, new: %s", oldCommit, commit)
-			}
-
-			if r.isHookUpdate(annotations, subKey) {
-				klog.Info("The topo annotation does not have applied hooks. Adding it.")
-			}
-			// Delete the existing deployables that meets the subscription
-			// selector and recreate them
-			r.deleteSubscriptionDeployables(sub)
-
-			baseDir := r.hubGitOps.GetRepoRootDirctory(sub)
-			resourcePath := getResourcePath(r.hubGitOps.ResolveLocalGitFolder, sub)
-
-			err = r.processRepo(primaryChannel, sub, r.hubGitOps.ResolveLocalGitFolder(sub), resourcePath, baseDir)
-
-			if err != nil {
-				klog.Error(err.Error())
-				return false, err
-			}
-
-			setCommitID(sub, commit)
-
-			r.updateGitSubDeployablesAnnotation(sub)
-
-			// Check and add cluster-admin annotation for multi-namepsace application
-			r.AddClusterAdminAnnotation(sub)
-
-			if annotations[appv1.AnnotationDeployables] == "" {
-				// this might have failed previously. Try again.
-				r.updateGitSubDeployablesAnnotation(sub)
-			}
-
-			if ifUpdateGitSubscriptionAnnotation(origsub, sub) {
-				updated = true
-			}
-		} else {
-			klog.Infof("The Git commit has not changed since the last reconcile. last: %s, new: %s", annotations[appv1.AnnotationGitCommit], commit)
-		}
-	}
-
-	return updated, nil
 }
 
 func (r *ReconcileSubscription) isHookUpdate(a map[string]string, subKey types.NamespacedName) bool {
@@ -381,12 +303,49 @@ func (r *ReconcileSubscription) updateAnnotationTopo(sub *subv1.Subscription, al
 	return nil
 }
 
-func (r *ReconcileSubscription) processRepo(chn *chnv1.Channel, sub *appv1.Subscription, localRepoRoot, subPath, baseDir string) error {
+func (r *ReconcileSubscription) createNamespaceResource(sub *subv1.Subscription) *unstructured.Unstructured {
+	namespace := &unstructured.Unstructured{}
+	namespace.SetName(sub.GetNamespace())
+	namespace.SetNamespace(sub.GetNamespace())
+	namespace.SetKind("Namespace")
+	namespace.SetAPIVersion("v1")
+	return namespace
+}
+
+func (r *ReconcileSubscription) processRepo(chn *chnv1.Channel, sub *appv1.Subscription,
+	localRepoRoot, subPath, baseDir string) ([]*unstructured.Unstructured, error) {
 	chartDirs, kustomizeDirs, crdsAndNamespaceFiles, rbacFiles, otherFiles, err := utils.SortResources(localRepoRoot, subPath)
 
 	if err != nil {
 		klog.Error(err, "Failed to sort kubernetes resources and helm charts.")
-		return err
+
+		return nil, err
+	}
+
+	// creating a list of all the resources.
+	var resourcesPaths []string
+	var resources []*unstructured.Unstructured
+
+	// getting all resource paths in one list.
+	resourcesPaths = append(resourcesPaths, crdsAndNamespaceFiles...)
+	resourcesPaths = append(resourcesPaths, rbacFiles...)
+	resourcesPaths = append(resourcesPaths, otherFiles...)
+
+	resources = append(resources, r.createNamespaceResource(sub))
+	// for each resource path, get all the resources in there and place them in an unstructured list.
+	for _, path := range resourcesPaths {
+		curResources, err := r.getUnstructuredFromPath(path)
+		if err != nil {
+			return nil, err
+		}
+		resources = append(resources, curResources...)
+	}
+
+	kustomizeResources, err := r.subscribeKustomizations(sub, kustomizeDirs, baseDir)
+	if err != nil {
+		klog.Errorf("Couldn't add kustomize resources, skipping. Err - \n%e", err)
+	} else {
+		resources = append(resources, kustomizeResources...)
 	}
 
 	// Build a helm repo index file
@@ -394,51 +353,19 @@ func (r *ReconcileSubscription) processRepo(chn *chnv1.Channel, sub *appv1.Subsc
 
 	if err != nil {
 		// If package name is not specified in the subscription, filterCharts throws an error. In this case, just return the original index file.
-		klog.Error(err, "Failed to generate helm index file.")
-		return err
+		klog.Errorf("Failed to generate helm index file. Skipping helm, %err", err)
+	} else {
+		b, _ := yaml.Marshal(indexFile)
+		klog.Info("New index file ", string(b))
+		helmResources, err := r.subscribeHelmCharts(chn, indexFile)
+		if err != nil {
+			klog.Errorf("Couldn't add helm resources, skipping. Err - \n%e", err)
+		} else {
+			resources = append(resources, helmResources...)
+		}
 	}
 
-	b, _ := yaml.Marshal(indexFile)
-	klog.Info("New index file ", string(b))
-
-	errMessage := ""
-
-	// Create deployables for kube resources and helm charts from the git repo
-	err = r.subscribeResources(chn, sub, crdsAndNamespaceFiles, baseDir)
-
-	if err != nil {
-		errMessage += err.Error() + "/n"
-	}
-
-	err = r.subscribeResources(chn, sub, rbacFiles, baseDir)
-
-	if err != nil {
-		errMessage += err.Error() + "/n"
-	}
-
-	err = r.subscribeResources(chn, sub, otherFiles, baseDir)
-
-	if err != nil {
-		errMessage += err.Error() + "/n"
-	}
-
-	err = r.subscribeKustomizations(chn, sub, kustomizeDirs, baseDir)
-
-	if err != nil {
-		errMessage += err.Error() + "/n"
-	}
-
-	err = r.subscribeHelmCharts(chn, sub, indexFile)
-
-	if err != nil {
-		errMessage += err.Error() + "/n"
-	}
-
-	if errMessage != "" {
-		return errors.New(errMessage)
-	}
-
-	return nil
+	return resources, nil
 }
 
 // clearSubscriptionTargetDpls clear the subscription target deployable if exists.
@@ -460,8 +387,9 @@ func (r *ReconcileSubscription) deleteSubscriptionDeployables(sub *appv1.Subscri
 	}
 }
 
-func (r *ReconcileSubscription) subscribeResources(chn *chnv1.Channel, sub *appv1.Subscription, rscFiles []string, baseDir string) error {
-	// sync kube resource deployables
+func (r *ReconcileSubscription) subscribeResources(rscFiles []string) []string {
+	var resources []string
+	// sync kube resource manifests
 	for _, rscFile := range rscFiles {
 		file, err := ioutil.ReadFile(rscFile) // #nosec G304 rscFile is not user input
 
@@ -479,26 +407,44 @@ func (r *ReconcileSubscription) subscribeResources(chn *chnv1.Channel, sub *appv
 
 		klog.Info("Processing ... " + rscFile)
 
-		resourceDir := strings.TrimPrefix(dir, baseDir)
-		resourceDir = strings.Trim(resourceDir, "/")
+		byteResources := utils.ParseKubeResoures(file)
 
-		resources := utils.ParseKubeResoures(file)
-
-		if len(resources) > 0 {
-			for _, resource := range resources {
-				err = r.createDeployable(chn, sub, resourceDir, resource)
-				if err != nil {
-					klog.Error(err.Error())
-					return err
-				}
-			}
+		for _, resource := range byteResources {
+			resources = append(resources, string(resource))
 		}
+	}
+
+	return resources
+}
+
+func (r *ReconcileSubscription) addObjectReference(objRefMap map[v1.ObjectReference]*v1.ObjectReference, filecontent []byte) error {
+	obj := &unstructured.Unstructured{}
+	if err := yaml.Unmarshal(filecontent, obj); err != nil {
+		klog.Error("Failed to unmarshal resource YAML.")
+		return err
+	}
+
+	objRef := &v1.ObjectReference{
+		Kind:       obj.GetKind(),
+		Namespace:  obj.GetNamespace(),
+		Name:       obj.GetName(),
+		APIVersion: obj.GetAPIVersion(),
+	}
+
+	objRefMap[*objRef] = objRef
+
+	errs := validation.IsDNS1123Subdomain(obj.GetName())
+	if len(errs) > 0 {
+		errs = append([]string{fmt.Sprintf("Invalid %s name '%s'", obj.GetKind(), obj.GetName())}, errs...)
+		return errors.New(strings.Join(errs, ", "))
 	}
 
 	return nil
 }
 
-func (r *ReconcileSubscription) subscribeKustomizations(chn *chnv1.Channel, sub *appv1.Subscription, kustomizeDirs map[string]string, baseDir string) error {
+func (r *ReconcileSubscription) subscribeKustomizations(sub *appv1.Subscription, kustomizeDirs map[string]string,
+	baseDir string) ([]*unstructured.Unstructured, error) {
+	var unstructuredResources []*unstructured.Unstructured
 	for _, kustomizeDir := range kustomizeDirs {
 		klog.Info("Applying kustomization ", kustomizeDir)
 
@@ -514,35 +460,111 @@ func (r *ReconcileSubscription) subscribeKustomizations(chn *chnv1.Channel, sub 
 
 		if err != nil {
 			klog.Error("Failed to applying kustomization, error: ", err.Error())
-			return err
+			return nil, err
 		}
 
 		// Split the output of kustomize build output into individual kube resource YAML files
 		resources := utils.ParseYAML(out)
+
 		for _, resource := range resources {
 			resourceFile := []byte(strings.Trim(resource, "\t \n"))
 
-			t := kubeResource{}
-			err := yaml.Unmarshal(resourceFile, &t)
+			var output *unstructured.Unstructured
+			err := yaml.Unmarshal(resourceFile, &output)
 
 			if err != nil {
-				klog.Error(err, "Failed to unmarshal YAML file")
-				continue
+				klog.Errorf("Failed to unmarshal YAML file, skipping it. Err -\n %e", err)
+			} else if output.GetAPIVersion() == "" || output.GetKind() == "" {
+				klog.Infof("%v\n is Not a Kubernetes resource, skipping it", output)
 			}
 
-			if t.APIVersion == "" || t.Kind == "" {
-				klog.Info("Not a Kubernetes resource")
-			} else {
-				err := r.createDeployable(chn, sub, strings.Trim(relativePath, "/"), resourceFile)
-				if err != nil {
-					klog.Error("Failed to apply a resource, error: ", err)
-					return err
-				}
-			}
+			unstructuredResources = append(unstructuredResources, output)
 		}
 	}
 
-	return nil
+	return unstructuredResources, nil
+}
+
+func (r *ReconcileSubscription) getUnstructuredFromPath(toInsert string) ([]*unstructured.Unstructured, error) {
+	file, err := ioutil.ReadFile(toInsert)
+	if err != nil {
+		return nil, err
+	}
+	resources := utils.ParseKubeResoures(file)
+	var unstructuredResources []*unstructured.Unstructured
+
+	for _, resource := range resources {
+		var output *unstructured.Unstructured
+		err = yaml.Unmarshal(resource, &output) // TODO: may be problematic
+		if err != nil {
+			klog.Errorf("Skipping a resource as it couldn't be unpacked, err: %e", err)
+			continue
+		} else if output.GetAPIVersion() == "" || output.GetKind() == "" {
+			klog.Infof("%v\n is Not a Kubernetes resource, skipping it", output)
+		}
+		unstructuredResources = append(unstructuredResources, output)
+	}
+	return unstructuredResources, nil
+}
+
+// GetGitResources clones the git repo and regenerate deployables and update annotation if needed
+func (r *ReconcileSubscription) GetGitResources(sub *appv1.Subscription) ([]*unstructured.Unstructured, error) {
+	var resources []*unstructured.Unstructured
+
+	origsub := &appv1.Subscription{}
+	sub.DeepCopyInto(origsub)
+
+	primaryChannel, _, err := r.getChannel(sub)
+
+	if err != nil {
+		klog.Errorf("Failed to find a channel for subscription: %s", sub.GetName())
+		return nil, err
+	}
+
+	if utils.IsGitChannel(string(primaryChannel.Spec.Type)) {
+		klog.Infof("Subscription %s has Git type channel.", sub.GetName())
+
+		//making sure the commit id is coming from the same source
+		commit, err := r.hubGitOps.GetLatestCommitID(sub)
+		if err != nil {
+			klog.Error(err.Error())
+			return nil, err
+		}
+
+		annotations := sub.GetAnnotations()
+		if annotations == nil {
+			annotations = make(map[string]string)
+			sub.SetAnnotations(annotations)
+		}
+
+		subKey := types.NamespacedName{Name: sub.GetName(), Namespace: sub.GetNamespace()}
+		// Compare the commit to the Git repo and update manifests only if the commit has changed
+		// If subscription does not have commit annotation, it needs to be generated in this block.
+		oldCommit := getCommitID(sub)
+
+		if r.isHookUpdate(annotations, subKey) {
+			klog.Info("The topo annotation does not have applied hooks. Adding it.")
+		}
+
+		baseDir := r.hubGitOps.GetRepoRootDirctory(sub)
+		resourcePath := getResourcePath(r.hubGitOps.ResolveLocalGitFolder, sub)
+
+		// Get all the resources as a list of unstructured object pointers from their paths.
+		resources, err = r.processRepo(primaryChannel,
+			sub, r.hubGitOps.ResolveLocalGitFolder(sub), resourcePath, baseDir)
+		if err != nil {
+			klog.Error(err.Error())
+			return nil, err
+		}
+
+		if oldCommit == "" || !strings.EqualFold(oldCommit, commit) {
+			klog.Infof("The Git commit has changed since the last reconcile. last: %s, new: %s", oldCommit, commit)
+
+			setCommitID(sub, commit)
+		}
+	}
+
+	return resources, nil
 }
 
 func (r *ReconcileSubscription) createDeployable(
@@ -648,7 +670,11 @@ type sourceURLs struct {
 	ChartPath string   `json:"chartPath,omitempty"`
 }
 
-func (r *ReconcileSubscription) subscribeHelmCharts(chn *chnv1.Channel, sub *appv1.Subscription, indexFile *repo.IndexFile) (err error) {
+func (r *ReconcileSubscription) subscribeHelmCharts(chn *chnv1.Channel,
+	indexFile *repo.IndexFile) ([]*unstructured.Unstructured, error) {
+
+	var unstructuredResources []*unstructured.Unstructured
+
 	for packageName, chartVersions := range indexFile.Entries {
 		klog.Infof("chart: %s\n%v", packageName, chartVersions)
 
@@ -675,23 +701,8 @@ func (r *ReconcileSubscription) subscribeHelmCharts(chn *chnv1.Channel, sub *app
 		spec.Source = src
 
 		obj.Object["spec"] = spec
-
-		dplSpec, err := json.Marshal(obj)
-
-		if err != nil {
-			klog.Error("failed to marshal helmrelease spec")
-			return err
-		}
-
-		klog.Info("generating deployable")
-
-		err = r.createDeployable(chn, sub, "", dplSpec)
-
-		if err != nil {
-			klog.Error("failed to create deployable for helmrelease: " + packageName + "-" + chartVersions[0].Version)
-			return err
-		}
+		unstructuredResources = append(unstructuredResources, obj)
 	}
 
-	return nil
+	return unstructuredResources, nil
 }

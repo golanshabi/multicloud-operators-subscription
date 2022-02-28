@@ -15,13 +15,12 @@
 package apis
 
 import (
-	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/klog"
-
 	chnapis "github.com/open-cluster-management/multicloud-operators-channel/pkg/apis"
 	dplapis "github.com/open-cluster-management/multicloud-operators-deployable/pkg/apis"
 	plrapis "github.com/open-cluster-management/multicloud-operators-placementrule/pkg/apis"
 	releaseapis "github.com/open-cluster-management/multicloud-operators-subscription-release/pkg/apis"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/klog"
 )
 
 // AddToSchemes may be used to add all resources defined in the project to a Scheme

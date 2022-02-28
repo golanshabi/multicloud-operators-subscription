@@ -17,7 +17,9 @@ package mcmhub
 import (
 	"context"
 	"fmt"
+	v1 "k8s.io/api/core/v1"
 	"math/rand"
+	manifestWorkV1 "open-cluster-management.io/api/work/v1"
 	"strings"
 	"time"
 
@@ -288,9 +290,9 @@ func (mapper *placementRuleMapper) Map(obj client.Object) []reconcile.Request {
 				continue
 			}
 
-			if len(placementRule.Status.Decisions) == 0 {
-				continue
-			}
+			//if len(placementRule.Status.Decisions) == 0 {
+			//	continue
+			//}
 
 			// in Reconcile(), removed the below suffix flag when processing the subscription
 			subKey := types.NamespacedName{Name: sub.GetName() + placementRuleFlag + obj.GetResourceVersion(), Namespace: sub.GetNamespace()}
@@ -532,6 +534,36 @@ func (r *ReconcileSubscription) Reconcile(ctx context.Context, request reconcile
 				return reconcile.Result{}, err
 			}
 
+			configMapName := "sub-" + request.Name + "-config"
+			var configMap v1.ConfigMap
+			err = r.Client.Get(context.TODO(), client.ObjectKey{Namespace: request.Namespace, Name: configMapName}, &configMap)
+			if errors.IsNotFound(err) {
+				return reconcile.Result{}, nil
+			} else if err != nil {
+				return reconcile.Result{}, err
+			}
+
+			clusters := strings.Split(configMap.Data["clusters"], " ")
+			var deleteManifest manifestWorkV1.ManifestWork
+			manifestName := "sub-" + request.Name + "-manifest"
+			for _, cluster := range clusters {
+				err = r.Client.Get(context.TODO(), client.ObjectKey{Namespace: cluster, Name: manifestName}, &deleteManifest)
+				if k8serrors.IsNotFound(err) {
+					continue
+				} else if err != nil {
+					return reconcile.Result{}, err
+				}
+
+				err = r.Client.Delete(context.TODO(), &deleteManifest)
+				if err != nil {
+					return reconcile.Result{}, err
+				}
+			}
+
+			err = r.Client.Delete(context.TODO(), &configMap)
+			if err != nil {
+				return reconcile.Result{}, err
+			}
 			r.hubGitOps.DeregisterBranch(request.NamespacedName)
 
 			return reconcile.Result{}, nil
@@ -620,7 +652,7 @@ func (r *ReconcileSubscription) Reconcile(ctx context.Context, request reconcile
 		}
 
 		//changes will be added to instance
-		err = r.doMCMHubReconcile(instance)
+		clusters, err := r.doMCMHubReconcile(instance, placementDecisionUpdated)
 
 		if err != nil {
 			r.logger.Error(err, "failed to process on doMCMHubReconcile")
@@ -629,8 +661,11 @@ func (r *ReconcileSubscription) Reconcile(ctx context.Context, request reconcile
 			instance.Status.Statuses = nil
 			returnErr = err
 		} else {
+			defer r.updateSubscriptionStatus(instance, clusters)
 			// Get propagation status from the subscription deployable
-			r.setHubSubscriptionStatus(instance)
+			instance.Status.Phase = appv1.SubscriptionPropagated
+			instance.Status.Message = ""
+			instance.Status.Reason = ""
 			// for object store, it takes a while for the object to be downloaded,
 			// so we want to requeue to get a valid topo annotation
 			if !isTopoAnnoExist(instance) {

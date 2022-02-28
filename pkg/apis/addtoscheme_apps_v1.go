@@ -15,11 +15,15 @@
 package apis
 
 import (
-	ansiblejob "github.com/open-cluster-management/multicloud-operators-subscription/pkg/apis/apps/ansible/v1alpha1"
 	v1 "github.com/open-cluster-management/multicloud-operators-subscription/pkg/apis/apps/v1"
+	spokeClusterV1 "open-cluster-management.io/api/cluster/v1"
+	clusterapi "open-cluster-management.io/api/cluster/v1alpha1"
+	placement "open-cluster-management.io/api/cluster/v1alpha1"
+	manifestWorkV1 "open-cluster-management.io/api/work/v1"
 )
 
 func init() {
 	// Register the types with the Scheme so the components can map objects to GroupVersionKinds and back
-	AddToSchemes = append(AddToSchemes, v1.SchemeBuilder.AddToScheme, ansiblejob.SchemeBuilder.AddToScheme)
+	AddToSchemes = append(AddToSchemes, v1.SchemeBuilder.AddToScheme,
+		manifestWorkV1.Install, clusterapi.Install, placement.Install, spokeClusterV1.Install)
 }

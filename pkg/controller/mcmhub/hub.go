@@ -27,14 +27,13 @@ import (
 	gerr "github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/klog"
 	"sigs.k8s.io/controller-runtime/pkg/client"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 
 	"github.com/ghodss/yaml"
 	chnv1 "github.com/open-cluster-management/multicloud-operators-channel/pkg/apis/apps/v1"
@@ -42,32 +41,34 @@ import (
 	dplv1 "github.com/open-cluster-management/multicloud-operators-deployable/pkg/apis/apps/v1"
 	dplv1alpha1 "github.com/open-cluster-management/multicloud-operators-deployable/pkg/apis/apps/v1"
 	dplutils "github.com/open-cluster-management/multicloud-operators-deployable/pkg/utils"
-	plrv1alpha1 "github.com/open-cluster-management/multicloud-operators-placementrule/pkg/apis/apps/v1"
 	releasev1 "github.com/open-cluster-management/multicloud-operators-subscription-release/pkg/apis/apps/v1"
-	appv1 "github.com/open-cluster-management/multicloud-operators-subscription/pkg/apis/apps/v1"
 	appv1alpha1 "github.com/open-cluster-management/multicloud-operators-subscription/pkg/apis/apps/v1"
 	"github.com/open-cluster-management/multicloud-operators-subscription/pkg/utils"
 	subutil "github.com/open-cluster-management/multicloud-operators-subscription/pkg/utils"
 	awsutils "github.com/open-cluster-management/multicloud-operators-subscription/pkg/utils/aws"
+	manifestWorkV1 "open-cluster-management.io/api/work/v1"
+	appv1 "open-cluster-management.io/multicloud-operators-subscription/pkg/apis/apps/v1"
+)
+
+const (
+	controllerName = "multicluster-operators-hub-subscription"
 )
 
 // doMCMHubReconcile process Subscription on hub - distribute it via deployable
-func (r *ReconcileSubscription) doMCMHubReconcile(sub *appv1alpha1.Subscription) error {
+func (r *ReconcileSubscription) doMCMHubReconcile(sub *appv1alpha1.Subscription, placementDecisionUpdated bool) ([]ManageClusters, error) {
 	substr := fmt.Sprintf("%v/%v", sub.GetNamespace(), sub.GetName())
-	klog.V(2).Infof("entry doMCMHubReconcile %v", substr)
+	klog.V(1).Infof("entry doMCMHubReconcile %v", substr)
 
-	defer klog.V(2).Infof("exix doMCMHubReconcile %v", substr)
+	defer klog.V(1).Infof("exit doMCMHubReconcile %v", substr)
 
-	targetSub, updateSub, err := r.updateSubscriptionToTarget(sub)
-	if err != nil {
-		return err
-	}
+	// TO-DO: need to implement the new appsub rolling update with no deployable dependency
 
 	primaryChannel, secondaryChannel, err := r.getChannel(sub)
 
 	if err != nil {
 		klog.Errorf("Failed to find a channel for subscription: %s", sub.GetName())
-		return err
+
+		return nil, err
 	}
 
 	if (primaryChannel != nil && secondaryChannel != nil) &&
@@ -78,7 +79,7 @@ func (r *ReconcileSubscription) doMCMHubReconcile(sub *appv1alpha1.Subscription)
 		newError := fmt.Errorf("the type of primary and secondary channels is different. primary channel type: %s, secondary channel type: %s",
 			primaryChannel.Spec.Type, secondaryChannel.Spec.Type)
 
-		return newError
+		return nil, newError
 	}
 
 	chnAnnotations := primaryChannel.GetAnnotations()
@@ -97,142 +98,224 @@ func (r *ReconcileSubscription) doMCMHubReconcile(sub *appv1alpha1.Subscription)
 		sub.SetLabels(sublabels)
 	}
 
-	updateSubDplAnno := false
+	klog.Infof("subscription: %v/%v", sub.GetNamespace(), sub.GetName())
+
+	// Check and add cluster-admin annotation for multi-namepsace application
+	//isAdmin := r.AddClusterAdminAnnotation(sub)
+
+	// Add or sync application labels
+	r.AddAppLabels(sub)
+
+	var resources []*unstructured.Unstructured
 
 	switch tp := strings.ToLower(string(primaryChannel.Spec.Type)); tp {
 	case chnv1alpha1.ChannelTypeGit, chnv1alpha1.ChannelTypeGitHub:
-		updateSubDplAnno, err = r.UpdateGitDeployablesAnnotation(sub)
-	case chnv1alpha1.ChannelTypeHelmRepo:
-		updateSubDplAnno, err = UpdateHelmTopoAnnotation(r.Client, r.cfg, primaryChannel, secondaryChannel, sub)
-	case chnv1alpha1.ChannelTypeObjectBucket:
-		updateSubDplAnno, err = r.updateObjectBucketAnnotation(sub, primaryChannel, secondaryChannel, objectBucketParent)
-	default:
-		updateSubDplAnno = r.UpdateDeployablesAnnotation(sub, deployableParent)
+		resources, err = r.GetGitResources(sub)
+		//case chnv1alpha1.ChannelTypeHelmRepo:
+		//	resources, err = getHelmTopoResources(r.Client, r.cfg, primaryChannel, secondaryChannel, sub, isAdmin)
+		//case chnv1alpha1.ChannelTypeObjectBucket:
+		//	resources, err = r.getObjectBucketResources(sub, primaryChannel, secondaryChannel, isAdmin)
 	}
 
-	if err != nil {
-		return err
-	}
+	manifestTemplate := &manifestWorkV1.ManifestWork{}
+	manifestTemplate.Name = "sub-" + sub.Name + "-manifest"
+	manifestTemplate.Annotations = sub.Annotations
+	manifestTemplate.Kind = "ManifestWork"
+	manifestTemplate.APIVersion = "work.open-cluster-management.io/v1"
+	manifestTemplate.SetAnnotations(appendToMap(manifestTemplate.GetAnnotations(), "owner-sub",
+		sub.GetNamespace()+"/"+sub.GetName()))
+	manifestTemplate.SetLabels(appendToMap(manifestTemplate.GetLabels(), "app", sub.GetLabels()["app"]))
 
-	klog.Infof("subscription: %v/%v, update Subscription: %v, update Subscription Deployable Annotation: %v",
-		sub.GetNamespace(), sub.GetName(), updateSub, updateSubDplAnno)
+	for _, unstructuredResource := range resources {
+		var finalResource []byte
 
-	dpl, err := r.prepareDeployableForSubscription(sub, nil)
-	if err != nil {
-		return err
-	}
+		// Add app owner label and sub owner annotation to each resource.
 
-	// if the subscription has the rollingupdate-target annotation, create a new deploayble as the target deployable of the subscription deployable
-	targetDpl, err := r.createTargetDplForRollingUpdate(sub, targetSub)
+		unstructuredResource.SetAnnotations(appendToMap(unstructuredResource.GetAnnotations(), "owner-sub",
+			sub.GetNamespace()+"/"+sub.GetName()))
 
-	if err != nil {
-		return err
-	}
+		unstructuredResource.SetLabels(appendToMap(unstructuredResource.GetLabels(), "app", sub.GetLabels()["app"]))
 
-	if targetDpl != nil {
-		dplAnno := setTargetDplAnnotation(sub, dpl, targetDpl)
-		dpl.SetAnnotations(dplAnno)
-	}
-
-	found := &dplv1alpha1.Deployable{}
-	dplkey := types.NamespacedName{Name: dpl.Name, Namespace: dpl.Namespace}
-	err = r.Get(context.TODO(), dplkey, found)
-
-	if err != nil && apierrors.IsNotFound(err) {
-		klog.V(1).Info("Creating Deployable - ", "namespace: ", dpl.Namespace, ", name: ", dpl.Name)
-		err = r.Create(context.TODO(), dpl)
-
-		//record events
-		addtionalMsg := "Depolyable " + dplkey.String() + " created in the subscription namespace for deploying the subscription to managed clusters"
-		r.eventRecorder.RecordEvent(sub, "Deploy", addtionalMsg, err)
-
-		return err
-	} else if err != nil {
-		return err
-	}
-
-	updateTargetAnno := checkRollingUpdateAnno(found, targetDpl, dpl)
-
-	updateSubDpl := checkSubDeployables(found, dpl)
-
-	if updateSub || updateSubDpl || updateTargetAnno {
-		klog.V(1).Infof("updateSub: %v, updateSubDpl: %v, updateTargetAnno: %v", updateSub, updateSubDpl, updateTargetAnno)
-
-		if targetDpl != nil {
-			klog.V(5).Infof("targetDpl: %#v", targetDpl)
+		if unstructuredResource.GetKind() != "Namespace" && unstructuredResource.GetNamespace() == "" {
+			unstructuredResource.SetNamespace(sub.Namespace)
 		}
 
-		dpl.Spec.DeepCopyInto(&found.Spec)
-		// may need to check owner ID and backoff it if is not owned by this subscription
-
-		foundanno := setFoundDplAnnotation(found, dpl, targetDpl, updateTargetAnno)
-		found.SetAnnotations(foundanno)
-
-		setFoundDplLabel(found, sub)
-
-		klog.V(5).Infof("Updating Deployable: %#v, ref dpl: %#v", found, dpl)
-
-		err = r.Update(context.TODO(), found)
-
-		//record events
-		addtionalMsg := "Depolyable " + dplkey.String() + " updated in the subscription namespace for deploying the subscription to managed clusters"
-		r.eventRecorder.RecordEvent(sub, "Deploy", addtionalMsg, err)
-
+		finalResource, err = json.Marshal(unstructuredResource)
 		if err != nil {
-			return err
+			return nil, err
 		}
-	} else {
-		klog.V(1).Infof("update Subscription status, sub:%v/%v", sub.GetNamespace(), sub.GetName())
-		err = r.updateSubscriptionStatus(sub, found, primaryChannel)
+
+		// Add the object into the manifest
+		raw := runtime.RawExtension{Raw: finalResource}
+		objToInsert := manifestWorkV1.Manifest{RawExtension: raw}
+		manifestTemplate.Spec.Workload.Manifests = append(manifestTemplate.Spec.Workload.Manifests, objToInsert)
 	}
 
-	return err
+	// get all managed clusters.
+	clusters, err := r.getClustersByPlacement(sub)
+
+	if err != nil {
+		klog.Error("Error in getting clusters:", err)
+	}
+
+	// look for the configMap with the old placement
+	configMapName := "sub-" + sub.GetName() + "-config"
+	var configMap corev1.ConfigMap
+
+	err = r.Client.Get(context.TODO(), client.ObjectKey{Namespace: sub.GetNamespace(), Name: configMapName}, &configMap)
+	var deleteManifest manifestWorkV1.ManifestWork
+
+	// if configMap is not found then this is a new subscription so we want to create it.
+	if k8serrors.IsNotFound(err) {
+		err = r.createConfigMap(sub, &configMap, configMapName, clusters)
+		if err != nil {
+			return nil, err
+		}
+	} else if err != nil {
+		return nil, err
+	} else if placementDecisionUpdated {
+		// if placementDesicionUpdated is true then the placement was changed so we need to change the propagated clusters.
+		oldClusters := strings.Split(configMap.Data["clusters"], " ")
+
+		// delete the manifestWork from the old placement clusters that aren't in the new placement.
+		for _, cluster := range difference(oldClusters, clusters) {
+			err = r.Client.Get(context.TODO(), client.ObjectKey{Namespace: cluster, Name: manifestTemplate.Name}, &deleteManifest)
+			if k8serrors.IsNotFound(err) {
+				continue
+			} else if err != nil {
+				return nil, err
+			}
+
+			err = r.Client.Delete(context.TODO(), &deleteManifest)
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		var clustersString strings.Builder
+		for _, cluster := range clusters[:len(clusters)-1] {
+			clustersString.WriteString(cluster.Cluster)
+			clustersString.WriteString(" ")
+		}
+
+		if len(clusters) != 0 {
+			clustersString.WriteString(clusters[len(clusters)-1].Cluster)
+		}
+
+		configMap.Data["clusters"] = clustersString.String()
+
+		err = r.Update(context.TODO(), &configMap)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	for _, cluster := range clusters {
+		manifestTemplate.SetNamespace(cluster.Cluster)
+
+		//manifestBytes, err := json.Marshal(manifestTemplate)
+		//if err != nil {
+		//	return nil, err
+		//}
+
+		//forceChanges := true
+		err = r.Client.Get(context.TODO(), client.ObjectKey{Namespace: cluster.Cluster, Name: manifestTemplate.Name},
+			&deleteManifest)
+		if k8serrors.IsNotFound(err) {
+			manifestTemplate.ResourceVersion = ""
+			err = r.Client.Create(context.TODO(), manifestTemplate)
+			if err != nil {
+				klog.Error(err)
+			}
+		} else if err != nil {
+			klog.Error(err)
+		} else {
+			manifestTemplate.ResourceVersion = deleteManifest.ResourceVersion
+			manifestTemplate.UID = deleteManifest.UID
+			err = r.Client.Update(context.TODO(), manifestTemplate)
+			if err != nil {
+				klog.Error(err)
+			}
+			//err = r.Client.Patch(context.TODO(), manifestTemplate, client.RawPatch(types.ApplyPatchType, manifestBytes),
+			//	&client.PatchOptions{
+			//		FieldManager: controllerName,
+			//		Force:        &forceChanges,
+			//	})
+		}
+	}
+
+	return clusters, nil
 }
 
-//checkSubDeployables check differences between existing subscription dpl (found) and new subscription dpl (dpl)
-// This is caused by end-user updates on the orignal subscription.
-func checkSubDeployables(found, dpl *dplv1alpha1.Deployable) bool {
-	if !reflect.DeepEqual(found.Spec.Overrides, dpl.Spec.Overrides) {
-		klog.V(1).Infof("different override, found: %#v, dpl: %#v", found.Spec.Overrides, dpl.Spec.Overrides)
-		return true
+// receives the data for a configMap and creates it.
+func (r *ReconcileSubscription) createConfigMap(sub *appv1alpha1.Subscription, configMap *corev1.ConfigMap,
+	configMapName string, clusters []ManageClusters) error {
+	// if configMap not found then create it.
+	var clustersString strings.Builder
+
+	configMap.Name = configMapName
+	configMap.SetAnnotations(appendToMap(configMap.GetAnnotations(), "owner-sub",
+		sub.GetNamespace()+"/"+sub.GetName()))
+	configMap.SetLabels(appendToMap(configMap.GetLabels(), "app", sub.GetLabels()["app"]))
+	configMap.Namespace = sub.Namespace
+	configMap.APIVersion = "v1"
+	configMap.Kind = "ConfigMap"
+	configMap.Data = map[string]string{}
+
+	if clusters != nil {
+		for _, cluster := range clusters[:len(clusters)-1] {
+			clustersString.WriteString(cluster.Cluster)
+			clustersString.WriteString(" ")
+		}
+
+		clustersString.WriteString(clusters[len(clusters)-1].Cluster)
 	}
 
-	if !reflect.DeepEqual(found.Spec.Placement, dpl.Spec.Placement) {
-		klog.V(1).Infof("different placement: found: %v, dpl: %v", found.Spec.Placement, dpl.Spec.Placement)
-		return true
-	}
+	configMap.Data["clusters"] = clustersString.String()
 
-	if !reflect.DeepEqual(found.GetLabels(), dpl.GetLabels()) {
-		klog.V(1).Infof("different label: found: %v, dpl: %v", found.GetLabels(), dpl.GetLabels())
-		return true
-	}
-
-	//compare template difference
-	org := &appv1.Subscription{}
-	err := json.Unmarshal(dpl.Spec.Template.Raw, org)
-
+	err := r.Client.Create(context.TODO(), configMap)
 	if err != nil {
-		klog.V(5).Info("Error in unmarshall, err:", err, " |template: ", string(dpl.Spec.Template.Raw))
-		return false
+		return err
 	}
 
-	fnd := &appv1.Subscription{}
-	err = json.Unmarshal(found.Spec.Template.Raw, fnd)
+	return nil
+}
 
-	if err != nil {
-		klog.V(5).Info("Error in unmarshall, err:", err, " |template: ", string(found.Spec.Template.Raw))
-		return false
+// appendToMap receive a map, key and value and adds the key - value combination if value is not "".
+func appendToMap(mapToAppend map[string]string, key, val string) map[string]string {
+	if mapToAppend == nil {
+		mapToAppend = map[string]string{}
 	}
 
-	fOrg := utils.FilterOutTimeRelatedFields(org)
-	fFnd := utils.FilterOutTimeRelatedFields(fnd)
-
-	if !reflect.DeepEqual(fOrg, fFnd) {
-		klog.V(5).Infof("different template: found:\n %v\n, dpl:\n %v\n", org, fnd)
-		return true
+	if val != "" {
+		mapToAppend[key] = val
 	}
 
-	return false
+	return mapToAppend
+}
+
+func (r *ReconcileSubscription) AddAppLabels(s *appv1alpha1.Subscription) {
+	labels := s.GetLabels()
+
+	if labels == nil {
+		labels = make(map[string]string)
+	}
+
+	if labels["app"] != "" { // if label "app" exists, sync with "app.kubernetes.io/part-of" label
+		if labels["app.kubernetes.io/part-of"] != labels["app"] {
+			labels["app.kubernetes.io/part-of"] = labels["app"]
+		}
+	} else { // if "app" label does not exist, set it and "app.kubernetes.io/part-of" label with the subscription name
+		if labels["app.kubernetes.io/part-of"] != s.Name {
+			labels["app.kubernetes.io/part-of"] = s.Name
+		}
+
+		if labels["app"] != s.Name {
+			labels["app"] = s.Name
+		}
+	}
+
+	s.SetLabels(labels)
 }
 
 // if there exists target subscription, update the source subscription based on its target subscription.
@@ -466,7 +549,7 @@ func (r *ReconcileSubscription) GetChannelNamespaceType(s *appv1alpha1.Subscript
 	return chNameSpace, chName, chType
 }
 
-func GetSubscriptionRefChannel(clt client.Client, s *appv1.Subscription) (*chnv1.Channel, *chnv1.Channel, error) {
+func GetSubscriptionRefChannel(clt client.Client, s *appv1alpha1.Subscription) (*chnv1.Channel, *chnv1.Channel, error) {
 	primaryChannel, err := parseGetChannel(clt, s.Spec.Channel)
 
 	if err != nil {
@@ -658,128 +741,6 @@ func (r *ReconcileSubscription) clearSubscriptionTargetDpl(sub *appv1alpha1.Subs
 	return nil
 }
 
-func (r *ReconcileSubscription) prepareDeployableForSubscription(sub, rootSub *appv1alpha1.Subscription) (*dplv1alpha1.Deployable, error) {
-	// Fetch the Subscription instance
-	subep := sub.DeepCopy()
-	b := true
-	subep.Spec.Placement = &plrv1alpha1.Placement{Local: &b}
-	subep.Spec.Overrides = nil
-	subep.ResourceVersion = ""
-	subep.UID = ""
-
-	subep.CreationTimestamp = metav1.Time{}
-	subep.Generation = 1
-	subep.SelfLink = ""
-
-	subep.OwnerReferences = nil
-
-	subepanno := r.updateSubAnnotations(sub)
-
-	if rootSub == nil {
-		subep.Name = sub.GetName() + appv1alpha1.SubscriptionNameSuffix
-		subepanno[dplv1alpha1.AnnotationSubscription] = subep.Namespace + "/" + sub.GetName()
-	} else {
-		subep.Name = rootSub.GetName() + appv1alpha1.SubscriptionNameSuffix
-		subepanno[dplv1alpha1.AnnotationSubscription] = rootSub.Namespace + "/" + rootSub.GetName()
-	}
-	// set channel generation as annotation
-	if subep.Spec.Channel != "" {
-		chng, err := r.GetChannelGeneration(subep)
-		if err == nil {
-			subepanno[appv1alpha1.AnnotationChannelGeneration] = chng
-		}
-	}
-
-	subep.SetAnnotations(subepanno)
-	subep.SetGroupVersionKind(schema.GroupVersionKind{
-		Group:   appv1alpha1.SchemeGroupVersion.Group,
-		Version: appv1alpha1.SchemeGroupVersion.Version,
-		Kind:    "Subscription",
-	})
-	(&appv1alpha1.SubscriptionStatus{}).DeepCopyInto(&subep.Status)
-
-	setSuscriptionLabel(subep)
-
-	rawep, err := json.Marshal(subep)
-	if err != nil {
-		klog.Info("Error in mashalling subscription ", subep, err)
-		return nil, err
-	}
-
-	// propagate subscription-pause label to the subscription deployable
-	labelPause := "false"
-	if subutil.GetPauseLabel(sub) {
-		labelPause = "true"
-	}
-
-	dpl := &dplv1alpha1.Deployable{
-		TypeMeta: metav1.TypeMeta{
-			Kind:       "Deployable",
-			APIVersion: "apps.open-cluster-management.io/v1",
-		},
-		ObjectMeta: metav1.ObjectMeta{
-			// deployable name can be longer than 63 characters because it is applicationName + -subscription-n-deployable.
-			// Deployable name is used by deployable controller to create a label.
-			Name:      utils.ValidateK8sLabel(utils.TrimLabelLast63Chars(sub.Name + "-deployable")),
-			Namespace: sub.Namespace,
-			Labels: map[string]string{
-				dplv1alpha1.LabelSubscriptionPause: labelPause,
-			},
-			Annotations: map[string]string{
-				dplv1alpha1.AnnotationLocal:       "false",
-				dplv1alpha1.AnnotationIsGenerated: "true",
-				appv1.AnnotationHosting:           fmt.Sprintf("%s/%s", sub.GetNamespace(), sub.GetName()),
-			},
-		},
-		Spec: dplv1alpha1.DeployableSpec{
-			Template: &runtime.RawExtension{
-				Raw: rawep,
-			},
-			Placement: sub.Spec.Placement,
-		},
-	}
-
-	ownerSub := sub
-	if rootSub != nil {
-		ownerSub = rootSub
-	}
-
-	if err = controllerutil.SetControllerReference(ownerSub, dpl, r.scheme); err != nil {
-		return nil, err
-	}
-
-	// apply "/" override to template, and carry other overrides to deployable.
-	for _, ov := range sub.Spec.Overrides {
-		if ov.ClusterName == "/" {
-			tplobj := &unstructured.Unstructured{}
-			err = json.Unmarshal(dpl.Spec.Template.Raw, tplobj)
-
-			if err != nil {
-				klog.Info("Error in unmarshall, err:", err, " |template: ", string(dpl.Spec.Template.Raw))
-				return nil, err
-			}
-
-			tplobj, err = dplutils.OverrideTemplate(tplobj, ov.ClusterOverrides)
-			if err != nil {
-				klog.Info("Error in overriding obj ", tplobj, err)
-				return nil, err
-			}
-
-			dpl.Spec.Template.Raw, err = json.Marshal(tplobj)
-			if err != nil {
-				klog.Info("Error in mashalling obj ", tplobj, err)
-				return nil, err
-			}
-		} else {
-			dplov := dplv1alpha1.Overrides{}
-			ov.DeepCopyInto(&dplov)
-			dpl.Spec.Overrides = append(dpl.Spec.Overrides, dplov)
-		}
-	}
-
-	return dpl, nil
-}
-
 func (r *ReconcileSubscription) updateSubAnnotations(sub *appv1alpha1.Subscription) map[string]string {
 	subepanno := make(map[string]string)
 
@@ -873,71 +834,95 @@ func (r *ReconcileSubscription) updateSubAnnotations(sub *appv1alpha1.Subscripti
 	return subepanno
 }
 
-func (r *ReconcileSubscription) updateSubscriptionStatus(sub *appv1alpha1.Subscription, found *dplv1alpha1.Deployable, chn *chnv1alpha1.Channel) error {
+func (r *ReconcileSubscription) updateSubscriptionStatus(sub *appv1alpha1.Subscription, clusterList []ManageClusters) {
 	r.logger.Info(fmt.Sprintf("entry doMCMHubReconcile:updateSubscriptionStatus %s", PrintHelper(sub)))
 	defer r.logger.Info(fmt.Sprintf("exit doMCMHubReconcile:updateSubscriptionStatus %s", PrintHelper(sub)))
-
+	manifestName := "sub-" + sub.Name + "-manifest"
 	newsubstatus := appv1alpha1.SubscriptionStatus{}
 
 	newsubstatus.AnsibleJobsStatus = *sub.Status.AnsibleJobsStatus.DeepCopy()
+	newsubstatus.Statuses = make(map[string]*appv1alpha1.SubscriptionPerClusterStatus)
 
-	newsubstatus.Phase = appv1alpha1.SubscriptionPropagated
-	newsubstatus.Message = ""
-	newsubstatus.Reason = ""
+	//msg := ""
 
-	msg := ""
+	var curManifest manifestWorkV1.ManifestWork
+	for _, cluster := range clusterList {
+		err := r.Client.Get(context.TODO(), client.ObjectKey{Namespace: cluster.Cluster, Name: manifestName}, &curManifest)
+		if err != nil {
+			klog.Infof("Failed finding manifest in namespace %s with name %s for subscription status.",
+				cluster.Cluster, manifestName)
+			klog.Errorf("err is %e", err)
+			return
+		}
 
-	if found.Status.Phase == dplv1alpha1.DeployableFailed {
-		newsubstatus.Statuses = nil
-	} else {
-		newsubstatus.Statuses = make(map[string]*appv1alpha1.SubscriptionPerClusterStatus)
+		mcsubstatus := &appv1alpha1.SubscriptionUnitStatus{}
+		packages := &appv1alpha1.SubscriptionPerClusterStatus{}
+		packages.SubscriptionPackageStatus = map[string]*appv1alpha1.SubscriptionUnitStatus{}
 
-		for cluster, cstatus := range found.Status.PropagatedStatus {
-			clusterSubStatus := &appv1alpha1.SubscriptionPerClusterStatus{}
-			subPkgStatus := make(map[string]*appv1alpha1.SubscriptionUnitStatus)
+		for _, resourceStatus := range curManifest.Status.ResourceStatus.Manifests {
+			mcsubstatus.LastUpdateTime = resourceStatus.Conditions[0].LastTransitionTime
+			mcsubstatus.Message = resourceStatus.Conditions[0].Message
+			mcsubstatus.Reason = resourceStatus.Conditions[0].Reason
 
-			if cstatus.ResourceStatus != nil {
-				mcsubstatus := &appv1alpha1.SubscriptionStatus{}
-				err := json.Unmarshal(cstatus.ResourceStatus.Raw, mcsubstatus)
-				if err != nil {
-					klog.Infof("Failed to unmashall ResourceStatus from target cluster: %v, in deployable: %v/%v", cluster, found.GetNamespace(), found.GetName())
-					return err
-				}
-
-				if msg == "" {
-					msg = fmt.Sprintf("%s:%s", cluster, mcsubstatus.Message)
-				} else {
-					msg += fmt.Sprintf(",%s:%s", cluster, mcsubstatus.Message)
-				}
-
-				//get status per package if exist, for namespace/objectStore/helmRepo channel subscription status
-				for _, lcStatus := range mcsubstatus.Statuses {
-					for pkg, pkgStatus := range lcStatus.SubscriptionPackageStatus {
-						subPkgStatus[pkg] = getStatusPerPackage(pkgStatus, chn)
-					}
-				}
-
-				//if no status per package, apply status.<per cluster>.resourceStatus, for github channel subscription status
-				if len(subPkgStatus) == 0 {
-					subUnitStatus := &appv1alpha1.SubscriptionUnitStatus{}
-					subUnitStatus.LastUpdateTime = mcsubstatus.LastUpdateTime
-					subUnitStatus.Phase = mcsubstatus.Phase
-					subUnitStatus.Message = mcsubstatus.Message
-					subUnitStatus.Reason = mcsubstatus.Reason
-
-					subPkgStatus["/"] = subUnitStatus
-				}
+			bytes, err := json.Marshal(resourceStatus.StatusFeedbacks)
+			if err != nil {
+				klog.Errorf("couldnt unmarshal resource when creating status - %e", err)
+				return
 			}
 
-			clusterSubStatus.SubscriptionPackageStatus = subPkgStatus
+			mcsubstatus.ResourceStatus = &runtime.RawExtension{Raw: bytes}
+			if resourceStatus.Conditions[1].Type == "Available" {
+				mcsubstatus.Phase = appv1alpha1.SubscriptionSubscribed
+			} else {
+				mcsubstatus.Phase = appv1alpha1.SubscriptionFailed
+			}
 
-			newsubstatus.Statuses[cluster] = clusterSubStatus
+			packages.SubscriptionPackageStatus[resourceStatus.ResourceMeta.Name] = mcsubstatus
 		}
+		newsubstatus.Statuses[cluster.Cluster] = packages
+
+		//if curManifest.Status.ResourceStatus != nil {
+		//	mcsubstatus := &appv1alpha1.SubscriptionStatus{}
+		//	err := json.Unmarshal(cstatus.ResourceStatus.Raw, mcsubstatus)
+		//	if err != nil {
+		//		klog.Infof("Failed to unmashall ResourceStatus from target cluster: %v, in deployable: %v/%v", cluster, found.GetNamespace(), found.GetName())
+		//		return err
+		//	}
+		//
+		//	if msg == "" {
+		//		msg = fmt.Sprintf("%s:%s", cluster, mcsubstatus.Message)
+		//	} else {
+		//		msg += fmt.Sprintf(",%s:%s", cluster, mcsubstatus.Message)
+		//	}
+		//
+		//	//get status per package if exist, for namespace/objectStore/helmRepo channel subscription status
+		//	for _, lcStatus := range mcsubstatus.Statuses {
+		//		for pkg, pkgStatus := range lcStatus.SubscriptionPackageStatus {
+		//			subPkgStatus[pkg] = getStatusPerPackage(pkgStatus, chn)
+		//		}
+		//	}
+		//
+		//	//if no status per package, apply status.<per cluster>.resourceStatus, for github channel subscription status
+		//	if len(subPkgStatus) == 0 {
+		//		subUnitStatus := &appv1alpha1.SubscriptionUnitStatus{}
+		//		subUnitStatus.LastUpdateTime = mcsubstatus.LastUpdateTime
+		//		subUnitStatus.Phase = mcsubstatus.Phase
+		//		subUnitStatus.Message = mcsubstatus.Message
+		//		subUnitStatus.Reason = mcsubstatus.Reason
+		//
+		//		subPkgStatus["/"] = subUnitStatus
+		//	}
+		//}
+		//
+		//clusterSubStatus.SubscriptionPackageStatus = subPkgStatus
+		//
+		//newsubstatus.Statuses[cluster] = clusterSubStatus
 	}
 
+	newsubstatus.Phase = appv1alpha1.SubscriptionPropagated
 	newsubstatus.LastUpdateTime = sub.Status.LastUpdateTime
 	klog.V(5).Info("Check status for ", sub.Namespace, "/", sub.Name, " with ", newsubstatus)
-	newsubstatus.Message = msg
+	newsubstatus.Message = "cluster5:active"
 
 	if !utils.IsEqualSubScriptionStatus(&sub.Status, &newsubstatus) {
 		klog.V(1).Infof("check subscription status sub: %v/%v, substatus: %#v, newsubstatus: %#v",
@@ -946,8 +931,6 @@ func (r *ReconcileSubscription) updateSubscriptionStatus(sub *appv1alpha1.Subscr
 		//perserve the Ansiblejob status
 		newsubstatus.DeepCopyInto(&sub.Status)
 	}
-
-	return nil
 }
 
 func getStatusPerPackage(pkgStatus *appv1alpha1.SubscriptionUnitStatus, chn *chnv1alpha1.Channel) *appv1alpha1.SubscriptionUnitStatus {
@@ -1169,27 +1152,6 @@ func (r *ReconcileSubscription) checkDeployableBySubcriptionPackageFilter(sub *a
 	}
 
 	return true
-}
-
-// createTargetDplForRollingUpdate create a new deployable to contain the target subscription
-func (r *ReconcileSubscription) createTargetDplForRollingUpdate(sub, targetSub *appv1alpha1.Subscription) (*dplv1alpha1.Deployable, error) {
-	if targetSub == nil {
-		return nil, nil
-	}
-
-	targetSubDpl, err := r.prepareDeployableForSubscription(targetSub, sub)
-
-	if err != nil {
-		klog.V(3).Infof("Prepare target Subscription deployable failed: %#v.", err)
-		return nil, err
-	}
-
-	targetSubDpl.Name = sub.Name + "-target-deployable"
-	targetSubDpl.Namespace = sub.Namespace
-
-	err = r.updateTargetSubscriptionDeployable(sub, targetSubDpl)
-
-	return targetSubDpl, err
 }
 
 func (r *ReconcileSubscription) updateTargetSubscriptionDeployable(sub *appv1alpha1.Subscription, targetSubDpl *dplv1alpha1.Deployable) error {
@@ -1428,4 +1390,19 @@ func (r *ReconcileSubscription) updateObjectBucketAnnotation(
 
 func generateDplNameFromKey(key string) string {
 	return strings.ReplaceAll(key, "/", "-")
+}
+
+// difference returns the elements in `a` that aren't in `b`.
+func difference(a []string, b []ManageClusters) []string {
+	mb := make(map[string]struct{}, len(b))
+	for _, x := range b {
+		mb[x.Cluster] = struct{}{}
+	}
+	var diff []string
+	for _, x := range a {
+		if _, found := mb[x]; !found {
+			diff = append(diff, x)
+		}
+	}
+	return diff
 }
